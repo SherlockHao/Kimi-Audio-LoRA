@@ -34,6 +34,7 @@ def get_model_info(model_path):
     
     # Check for config.json
     config_file = os.path.join(model_path, "config.json")
+    model_config = {}
     if os.path.exists(config_file):
         with open(config_file, 'r') as f:
             model_config = json.load(f)
@@ -42,6 +43,11 @@ def get_model_info(model_path):
         print(f"Hidden size: {model_config.get('hidden_size', 'Unknown')}")
         print(f"Num layers: {model_config.get('num_hidden_layers', 'Unknown')}")
         print(f"Vocab size: {model_config.get('vocab_size', 'Unknown')}")
+        # Check for audio-specific configs
+        if 'audio_enc_hidden_size' in model_config:
+            print(f"Audio encoder hidden size: {model_config['audio_enc_hidden_size']}")
+        if 'n_mels' in model_config:
+            print(f"Mel bins: {model_config['n_mels']}")
     
     # Check for model files
     model_files = [f for f in os.listdir(model_path) if f.endswith(('.bin', '.safetensors', '.pt', '.pth'))]
@@ -207,19 +213,69 @@ def load_tokenizer(tokenizer_path):
     """Load GLM-4 tokenizer"""
     print(f"\nLoading tokenizer from: {tokenizer_path}")
     
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path,
-        trust_remote_code=True
-    )
+    # First check what files are in the tokenizer directory
+    if os.path.exists(tokenizer_path):
+        files = os.listdir(tokenizer_path)
+        print(f"Tokenizer files found: {files}")
+        
+        # Check for tokenizer config
+        tokenizer_config_file = os.path.join(tokenizer_path, "tokenizer_config.json")
+        if os.path.exists(tokenizer_config_file):
+            with open(tokenizer_config_file, 'r') as f:
+                tokenizer_config = json.load(f)
+            print(f"Tokenizer type: {tokenizer_config.get('tokenizer_class', 'Unknown')}")
+    
+    try:
+        # Try loading with trust_remote_code first
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+            use_fast=False  # Try slow tokenizer to avoid fast tokenizer issues
+        )
+    except Exception as e:
+        print(f"Failed to load tokenizer with AutoTokenizer: {e}")
+        
+        # If it's a custom tokenizer, try loading directly
+        try:
+            # Check if there's a custom tokenizer file
+            tokenizer_files = [f for f in os.listdir(tokenizer_path) if f.startswith('tokenization_') and f.endswith('.py')]
+            
+            if tokenizer_files:
+                # Import custom tokenizer
+                tokenizer_file = os.path.join(tokenizer_path, tokenizer_files[0])
+                spec = importlib.util.spec_from_file_location("custom_tokenizer", tokenizer_file)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                # Find tokenizer class
+                for name, obj in module.__dict__.items():
+                    if name.endswith('Tokenizer') and hasattr(obj, 'from_pretrained'):
+                        TokenizerClass = obj
+                        tokenizer = TokenizerClass.from_pretrained(tokenizer_path, trust_remote_code=True)
+                        break
+            else:
+                raise ValueError("No custom tokenizer file found")
+                
+        except Exception as e2:
+            print(f"Failed to load custom tokenizer: {e2}")
+            raise
     
     # Set padding token if not set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is None:
+        if hasattr(tokenizer, 'eos_token') and tokenizer.eos_token:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            # Set a default pad token
+            tokenizer.add_special_tokens({'pad_token': '<pad>'})
     
     print(f"Tokenizer loaded successfully!")
-    print(f"Vocab size: {tokenizer.vocab_size}")
-    print(f"Pad token: {tokenizer.pad_token}")
-    print(f"EOS token: {tokenizer.eos_token}")
+    print(f"Tokenizer class: {type(tokenizer).__name__}")
+    if hasattr(tokenizer, 'vocab_size'):
+        print(f"Vocab size: {tokenizer.vocab_size}")
+    if hasattr(tokenizer, 'pad_token'):
+        print(f"Pad token: {tokenizer.pad_token}")
+    if hasattr(tokenizer, 'eos_token'):
+        print(f"EOS token: {tokenizer.eos_token}")
     
     return tokenizer
 
@@ -284,7 +340,18 @@ def test_model_setup():
         
         # 2. Load tokenizer
         print("\n2. Loading Tokenizer:")
-        tokenizer = load_tokenizer(config['models']['tokenizer'])
+        try:
+            tokenizer = load_tokenizer(config['models']['tokenizer'])
+        except Exception as e:
+            print(f"Failed to load tokenizer from {config['models']['tokenizer']}: {e}")
+            print("Trying to load tokenizer from Kimi-Audio model...")
+            try:
+                # Try loading tokenizer from the main model directory
+                tokenizer = load_tokenizer(config['models']['kimi_audio'])
+            except Exception as e2:
+                print(f"Failed to load tokenizer from Kimi-Audio model: {e2}")
+                print("Proceeding without tokenizer (ASR might not need text tokenizer)")
+                tokenizer = None
         
         # 3. Configure LoRA
         print("\n3. Configuring LoRA:")
@@ -297,33 +364,37 @@ def test_model_setup():
         
         # 5. Test forward pass with dummy data
         print("\n5. Testing Forward Pass:")
-        try:
-            # Create dummy input
-            dummy_text = "This is a test transcription"
-            inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
-            
-            # Move to device
-            device = next(model.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            # Forward pass
-            with torch.no_grad():
-                outputs = model(**inputs)
-            
-            print("Forward pass successful!")
-            if hasattr(outputs, 'logits'):
-                print(f"Output logits shape: {outputs.logits.shape}")
-            else:
-                print("Model output received (custom format)")
-            
-        except Exception as e:
-            print(f"Forward pass test failed: {e}")
-            print("This might be expected for audio models that require special inputs")
+        if tokenizer is not None:
+            try:
+                # Create dummy input
+                dummy_text = "This is a test transcription"
+                inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
+                
+                # Move to device
+                device = next(model.parameters()).device
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                # Forward pass
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                
+                print("Forward pass successful!")
+                if hasattr(outputs, 'logits'):
+                    print(f"Output logits shape: {outputs.logits.shape}")
+                else:
+                    print("Model output received (custom format)")
+                
+            except Exception as e:
+                print(f"Forward pass test failed: {e}")
+                print("This might be expected for audio models that require special inputs")
+        else:
+            print("Skipping forward pass test (no tokenizer available)")
+            print("For ASR models, audio features are typically the main input")
         
         # Save model configuration
         model_setup = {
             "model_path": config['models']['kimi_audio'],
-            "tokenizer_path": config['models']['tokenizer'],
+            "tokenizer_path": config['models']['tokenizer'] if tokenizer else None,
             "whisper_path": config['models']['whisper'],
             "lora_config": {
                 "r": lora_config.r,
@@ -334,7 +405,8 @@ def test_model_setup():
             },
             "model_dtype": "bfloat16",
             "total_params": sum(p.numel() for p in model.parameters()),
-            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad)
+            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "tokenizer_loaded": tokenizer is not None
         }
         
         setup_path = os.path.join(CODE_DIR, "model_setup.json")
