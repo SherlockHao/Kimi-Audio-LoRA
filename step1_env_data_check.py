@@ -13,7 +13,7 @@ from collections import Counter
 # Configuration
 BASE_DIR = "/opt/data/nvme4/kimi"
 DATA_DIR = os.path.join(BASE_DIR, "data/test2")
-CODE_DIR = os.path.join(BASE_DIR, "kimi_train")
+CODE_DIR = os.path.join(BASE_DIR, "Kimi-Audio-LoRA")
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 
 # Create directories
