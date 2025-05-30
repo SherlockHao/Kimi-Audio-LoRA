@@ -61,6 +61,18 @@ def load_kimi_audio_model_direct(model_path):
     print(f"\nLoading Kimi-Audio model using direct import from: {model_path}")
     
     try:
+        # Add model path to sys.path to enable imports
+        if model_path not in sys.path:
+            sys.path.insert(0, model_path)
+        
+        # First, load the configuration module
+        config_file = os.path.join(model_path, "configuration_moonshot_kimia.py")
+        if os.path.exists(config_file):
+            spec = importlib.util.spec_from_file_location("configuration_moonshot_kimia", config_file)
+            config_module = importlib.util.module_from_spec(spec)
+            sys.modules["configuration_moonshot_kimia"] = config_module
+            spec.loader.exec_module(config_module)
+        
         # Load the custom modeling file
         modeling_file = os.path.join(model_path, "modeling_moonshot_kimia.py")
         if not os.path.exists(modeling_file):
@@ -90,7 +102,8 @@ def load_kimi_audio_model_direct(model_path):
             # Use safetensors if available
             from safetensors.torch import load_file
             state_dict = {}
-            for f in state_dict_files:
+            for f in sorted(state_dict_files):
+                print(f"  Loading {f}...")
                 state_dict.update(load_file(os.path.join(model_path, f)))
             model.load_state_dict(state_dict, strict=False)
         else:
@@ -98,7 +111,8 @@ def load_kimi_audio_model_direct(model_path):
             bin_files = [f for f in os.listdir(model_path) if f.endswith('.bin')]
             if bin_files:
                 state_dict = {}
-                for f in bin_files:
+                for f in sorted(bin_files):
+                    print(f"  Loading {f}...")
                     state_dict.update(torch.load(os.path.join(model_path, f), map_location='cpu'))
                 model.load_state_dict(state_dict, strict=False)
         
@@ -110,6 +124,48 @@ def load_kimi_audio_model_direct(model_path):
         
     except Exception as e:
         print(f"Error with direct loading: {e}")
+        # Try alternative approach using AutoModel with post_init fix
+        print("Trying alternative loading with post_init fix...")
+        return load_kimi_audio_model_auto(model_path)
+
+def load_kimi_audio_model_auto(model_path):
+    """Load Kimi-Audio model using AutoModel with fixes"""
+    print(f"\nLoading Kimi-Audio model using AutoModel from: {model_path}")
+    
+    try:
+        from transformers import AutoModelForCausalLM
+        
+        # Temporarily patch the problematic post_init
+        original_post_init = PreTrainedModel.post_init
+        
+        def patched_post_init(self):
+            try:
+                original_post_init(self)
+            except TypeError as e:
+                if "argument of type 'NoneType' is not iterable" in str(e):
+                    print("Skipping problematic post_init check")
+                    pass
+                else:
+                    raise
+        
+        PreTrainedModel.post_init = patched_post_init
+        
+        # Load model
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto" if torch.cuda.device_count() > 1 else None,
+            trust_remote_code=True
+        )
+        
+        # Restore original post_init
+        PreTrainedModel.post_init = original_post_init
+        
+        print("Model loaded successfully using AutoModel!")
+        return model
+        
+    except Exception as e:
+        print(f"Error with AutoModel loading: {e}")
         raise
 
 def load_kimi_audio_model(model_path, device_map="auto"):
@@ -143,7 +199,8 @@ def load_kimi_audio_model(model_path, device_map="auto"):
         return model
         
     except Exception as e:
-        print(f"All loading methods failed: {e}")
+        print(f"Direct loading failed: {e}")
+        print("Model loading failed. Please check the model files and configuration.")
         raise
 
 def load_tokenizer(tokenizer_path):
