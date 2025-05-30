@@ -458,7 +458,7 @@ def test_model_setup():
             "lora_config": {
                 "r": lora_config.r,
                 "lora_alpha": lora_config.lora_alpha,
-                "target_modules": lora_config.target_modules,
+                "target_modules": list(lora_config.target_modules) if isinstance(lora_config.target_modules, set) else lora_config.target_modules,
                 "lora_dropout": lora_config.lora_dropout,
                 "bias": lora_config.bias,
             },
