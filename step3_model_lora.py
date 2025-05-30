@@ -34,6 +34,7 @@ def get_model_info(model_path):
     
     # Check for config.json
     config_file = os.path.join(model_path, "config.json")
+    model_config = {}
     if os.path.exists(config_file):
         with open(config_file, 'r') as f:
             model_config = json.load(f)
@@ -42,6 +43,11 @@ def get_model_info(model_path):
         print(f"Hidden size: {model_config.get('hidden_size', 'Unknown')}")
         print(f"Num layers: {model_config.get('num_hidden_layers', 'Unknown')}")
         print(f"Vocab size: {model_config.get('vocab_size', 'Unknown')}")
+        # Check for audio-specific configs
+        if 'audio_enc_hidden_size' in model_config:
+            print(f"Audio encoder hidden size: {model_config['audio_enc_hidden_size']}")
+        if 'n_mels' in model_config:
+            print(f"Mel bins: {model_config['n_mels']}")
     
     # Check for model files
     model_files = [f for f in os.listdir(model_path) if f.endswith(('.bin', '.safetensors', '.pt', '.pth'))]
@@ -300,6 +306,22 @@ def configure_lora(model, target_modules=None):
         
         print(f"Selected target modules: {target_modules}")
     
+    # Add prepare_inputs_for_generation if it doesn't exist
+    if not hasattr(model, 'prepare_inputs_for_generation'):
+        print("Adding prepare_inputs_for_generation method to model...")
+        def prepare_inputs_for_generation(input_ids, **kwargs):
+            # Simple implementation that just returns the inputs
+            model_inputs = {"input_ids": input_ids}
+            # Add any other inputs from kwargs that the model might need
+            for key in ['attention_mask', 'position_ids', 'past_key_values']:
+                if key in kwargs:
+                    model_inputs[key] = kwargs[key]
+            return model_inputs
+        
+        # Bind the method to the model
+        import types
+        model.prepare_inputs_for_generation = types.MethodType(prepare_inputs_for_generation, model)
+    
     # LoRA configuration
     lora_config = LoraConfig(
         r=32,  # LoRA rank
@@ -311,11 +333,31 @@ def configure_lora(model, target_modules=None):
     )
     
     # Prepare model for training
-    model.gradient_checkpointing_enable()
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+    
+    # Prepare model for k-bit training
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     
     # Apply LoRA
-    model = get_peft_model(model, lora_config)
+    try:
+        model = get_peft_model(model, lora_config)
+        
+        # If the model still doesn't have prepare_inputs_for_generation after PEFT wrapping
+        if not hasattr(model, 'prepare_inputs_for_generation'):
+            model.prepare_inputs_for_generation = model.base_model.prepare_inputs_for_generation
+    except AttributeError as e:
+        print(f"Warning: {e}")
+        print("Attempting to fix by adding missing methods...")
+        
+        # Add any other missing methods that PEFT might expect
+        base_model = model
+        model = get_peft_model(base_model, lora_config)
+        
+        # Copy methods from base model if needed
+        for method_name in ['prepare_inputs_for_generation', 'can_generate', '_reorder_cache']:
+            if hasattr(base_model, method_name) and not hasattr(model, method_name):
+                setattr(model, method_name, getattr(base_model, method_name))
     
     # Print LoRA info
     model.print_trainable_parameters()
@@ -358,33 +400,37 @@ def test_model_setup():
         
         # 5. Test forward pass with dummy data
         print("\n5. Testing Forward Pass:")
-        try:
-            # Create dummy input
-            dummy_text = "This is a test transcription"
-            inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
-            
-            # Move to device
-            device = next(model.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            # Forward pass
-            with torch.no_grad():
-                outputs = model(**inputs)
-            
-            print("Forward pass successful!")
-            if hasattr(outputs, 'logits'):
-                print(f"Output logits shape: {outputs.logits.shape}")
-            else:
-                print("Model output received (custom format)")
-            
-        except Exception as e:
-            print(f"Forward pass test failed: {e}")
-            print("This might be expected for audio models that require special inputs")
+        if tokenizer is not None:
+            try:
+                # Create dummy input
+                dummy_text = "This is a test transcription"
+                inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
+                
+                # Move to device
+                device = next(model.parameters()).device
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                # Forward pass
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                
+                print("Forward pass successful!")
+                if hasattr(outputs, 'logits'):
+                    print(f"Output logits shape: {outputs.logits.shape}")
+                else:
+                    print("Model output received (custom format)")
+                
+            except Exception as e:
+                print(f"Forward pass test failed: {e}")
+                print("This might be expected for audio models that require special inputs")
+        else:
+            print("Skipping forward pass test (no tokenizer available)")
+            print("For ASR models, audio features are typically the main input")
         
         # Save model configuration
         model_setup = {
             "model_path": config['models']['kimi_audio'],
-            "tokenizer_path": config['models']['tokenizer'],
+            "tokenizer_path": config['models']['tokenizer'] if tokenizer else None,
             "whisper_path": config['models']['whisper'],
             "lora_config": {
                 "r": lora_config.r,
@@ -395,7 +441,8 @@ def test_model_setup():
             },
             "model_dtype": "bfloat16",
             "total_params": sum(p.numel() for p in model.parameters()),
-            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad)
+            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "tokenizer_loaded": tokenizer is not None
         }
         
         setup_path = os.path.join(CODE_DIR, "model_setup.json")
