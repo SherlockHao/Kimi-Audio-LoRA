@@ -266,16 +266,31 @@ def load_tokenizer(tokenizer_path):
             tokenizer.pad_token = tokenizer.eos_token
         else:
             # Set a default pad token
-            tokenizer.add_special_tokens({'pad_token': '<pad>'})
+            try:
+                tokenizer.add_special_tokens({'pad_token': '<pad>'})
+            except:
+                print("Could not add pad token to tokenizer")
     
     print(f"Tokenizer loaded successfully!")
     print(f"Tokenizer class: {type(tokenizer).__name__}")
-    if hasattr(tokenizer, 'vocab_size'):
-        print(f"Vocab size: {tokenizer.vocab_size}")
-    if hasattr(tokenizer, 'pad_token'):
-        print(f"Pad token: {tokenizer.pad_token}")
-    if hasattr(tokenizer, 'eos_token'):
-        print(f"EOS token: {tokenizer.eos_token}")
+    
+    # Safely check for vocab_size
+    try:
+        if hasattr(tokenizer, 'vocab_size'):
+            print(f"Vocab size: {tokenizer.vocab_size}")
+        elif hasattr(tokenizer, 'n_vocab'):
+            print(f"Vocab size: {tokenizer.n_vocab}")
+    except:
+        print("Could not determine vocab size")
+    
+    # Safely check for special tokens
+    try:
+        if hasattr(tokenizer, 'pad_token'):
+            print(f"Pad token: {tokenizer.pad_token}")
+        if hasattr(tokenizer, 'eos_token'):
+            print(f"EOS token: {tokenizer.eos_token}")
+    except:
+        print("Could not determine special tokens")
     
     return tokenizer
 
@@ -404,11 +419,19 @@ def test_model_setup():
             try:
                 # Create dummy input
                 dummy_text = "This is a test transcription"
-                inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
+                
+                # Handle different tokenizer types
+                try:
+                    inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
+                except TypeError as e:
+                    # Some tokenizers might not support all parameters
+                    print(f"Standard tokenization failed: {e}")
+                    print("Trying simplified tokenization...")
+                    inputs = tokenizer(dummy_text, return_tensors="pt")
                 
                 # Move to device
                 device = next(model.parameters()).device
-                inputs = {k: v.to(device) for k, v in inputs.items()}
+                inputs = {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
                 
                 # Forward pass
                 with torch.no_grad():
@@ -430,7 +453,7 @@ def test_model_setup():
         # Save model configuration
         model_setup = {
             "model_path": config['models']['kimi_audio'],
-            "tokenizer_path": config['models']['tokenizer'] if tokenizer else None,
+            "tokenizer_path": config['models']['tokenizer'] if tokenizer is not None else None,
             "whisper_path": config['models']['whisper'],
             "lora_config": {
                 "r": lora_config.r,
