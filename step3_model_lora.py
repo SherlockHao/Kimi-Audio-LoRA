@@ -34,7 +34,6 @@ def get_model_info(model_path):
     
     # Check for config.json
     config_file = os.path.join(model_path, "config.json")
-    model_config = {}
     if os.path.exists(config_file):
         with open(config_file, 'r') as f:
             model_config = json.load(f)
@@ -43,11 +42,6 @@ def get_model_info(model_path):
         print(f"Hidden size: {model_config.get('hidden_size', 'Unknown')}")
         print(f"Num layers: {model_config.get('num_hidden_layers', 'Unknown')}")
         print(f"Vocab size: {model_config.get('vocab_size', 'Unknown')}")
-        # Check for audio-specific configs
-        if 'audio_enc_hidden_size' in model_config:
-            print(f"Audio encoder hidden size: {model_config['audio_enc_hidden_size']}")
-        if 'n_mels' in model_config:
-            print(f"Mel bins: {model_config['n_mels']}")
     
     # Check for model files
     model_files = [f for f in os.listdir(model_path) if f.endswith(('.bin', '.safetensors', '.pt', '.pth'))]
@@ -364,37 +358,33 @@ def test_model_setup():
         
         # 5. Test forward pass with dummy data
         print("\n5. Testing Forward Pass:")
-        if tokenizer is not None:
-            try:
-                # Create dummy input
-                dummy_text = "This is a test transcription"
-                inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
-                
-                # Move to device
-                device = next(model.parameters()).device
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                
-                # Forward pass
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                
-                print("Forward pass successful!")
-                if hasattr(outputs, 'logits'):
-                    print(f"Output logits shape: {outputs.logits.shape}")
-                else:
-                    print("Model output received (custom format)")
-                
-            except Exception as e:
-                print(f"Forward pass test failed: {e}")
-                print("This might be expected for audio models that require special inputs")
-        else:
-            print("Skipping forward pass test (no tokenizer available)")
-            print("For ASR models, audio features are typically the main input")
+        try:
+            # Create dummy input
+            dummy_text = "This is a test transcription"
+            inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
+            
+            # Move to device
+            device = next(model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # Forward pass
+            with torch.no_grad():
+                outputs = model(**inputs)
+            
+            print("Forward pass successful!")
+            if hasattr(outputs, 'logits'):
+                print(f"Output logits shape: {outputs.logits.shape}")
+            else:
+                print("Model output received (custom format)")
+            
+        except Exception as e:
+            print(f"Forward pass test failed: {e}")
+            print("This might be expected for audio models that require special inputs")
         
         # Save model configuration
         model_setup = {
             "model_path": config['models']['kimi_audio'],
-            "tokenizer_path": config['models']['tokenizer'] if tokenizer else None,
+            "tokenizer_path": config['models']['tokenizer'],
             "whisper_path": config['models']['whisper'],
             "lora_config": {
                 "r": lora_config.r,
@@ -405,8 +395,7 @@ def test_model_setup():
             },
             "model_dtype": "bfloat16",
             "total_params": sum(p.numel() for p in model.parameters()),
-            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
-            "tokenizer_loaded": tokenizer is not None
+            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad)
         }
         
         setup_path = os.path.join(CODE_DIR, "model_setup.json")
