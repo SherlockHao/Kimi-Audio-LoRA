@@ -9,7 +9,8 @@ from transformers import (
     AutoTokenizer,
     AutoConfig,
     WhisperProcessor,
-    PreTrainedModel
+    PreTrainedModel,
+    WhisperFeatureExtractor
 )
 from peft import (
     LoraConfig,
@@ -27,6 +28,98 @@ config_path = os.path.join(CODE_DIR, "config.json")
 
 with open(config_path, 'r') as f:
     config = json.load(f)
+
+def load_glm4_voice_tokenizer(tokenizer_path):
+    """Load GLM-4 voice tokenizer for audio tokenization"""
+    print(f"\nLoading GLM-4 voice tokenizer from: {tokenizer_path}")
+    
+    try:
+        # Add tokenizer path to sys.path
+        if tokenizer_path not in sys.path:
+            sys.path.insert(0, tokenizer_path)
+        
+        # Check if the custom tokenizer files exist
+        glm4_tokenizer_file = os.path.join(tokenizer_path, "glm4_tokenizer.py")
+        glm4_utils_file = os.path.join(tokenizer_path, "glm4_utils.py")
+        
+        if not os.path.exists(glm4_tokenizer_file):
+            # Try to find it in subdirectories
+            for root, dirs, files in os.walk(tokenizer_path):
+                if "glm4_tokenizer.py" in files:
+                    glm4_tokenizer_file = os.path.join(root, "glm4_tokenizer.py")
+                    glm4_utils_file = os.path.join(root, "glm4_utils.py")
+                    break
+        
+        if os.path.exists(glm4_tokenizer_file):
+            # Import the custom tokenizer
+            spec = importlib.util.spec_from_file_location("glm4_tokenizer", glm4_tokenizer_file)
+            tokenizer_module = importlib.util.module_from_spec(spec)
+            sys.modules["glm4_tokenizer"] = tokenizer_module
+            spec.loader.exec_module(tokenizer_module)
+            
+            # Import utils if exists
+            if os.path.exists(glm4_utils_file):
+                spec_utils = importlib.util.spec_from_file_location("glm4_utils", glm4_utils_file)
+                utils_module = importlib.util.module_from_spec(spec_utils)
+                sys.modules["glm4_utils"] = utils_module
+                spec_utils.loader.exec_module(utils_module)
+            
+            # Get the tokenizer class
+            Glm4Tokenizer = getattr(tokenizer_module, "Glm4Tokenizer")
+            
+            # Initialize the voice tokenizer
+            voice_tokenizer = Glm4Tokenizer(tokenizer_path)
+            
+            print("GLM-4 voice tokenizer loaded successfully!")
+            print("This is an audio tokenizer, not a text tokenizer")
+            
+            return voice_tokenizer
+        else:
+            # Fallback: try to load as WhisperVQEncoder
+            print("Custom tokenizer files not found, trying WhisperVQEncoder approach...")
+            
+            from transformers import WhisperFeatureExtractor
+            
+            # Check for WhisperVQEncoder in the directory
+            modeling_files = [f for f in os.listdir(tokenizer_path) if "modeling" in f and f.endswith(".py")]
+            
+            if modeling_files:
+                # Import the modeling file
+                modeling_file = os.path.join(tokenizer_path, modeling_files[0])
+                spec = importlib.util.spec_from_file_location("whisper_vq", modeling_file)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                # Try to find WhisperVQEncoder class
+                WhisperVQEncoder = getattr(module, "WhisperVQEncoder", None)
+                
+                if WhisperVQEncoder:
+                    model = WhisperVQEncoder.from_pretrained(tokenizer_path)
+                    feature_extractor = WhisperFeatureExtractor.from_pretrained(tokenizer_path)
+                    
+                    # Create a simple wrapper
+                    class VoiceTokenizerWrapper:
+                        def __init__(self, model, feature_extractor):
+                            self.model = model.eval()
+                            self.feature_extractor = feature_extractor
+                        
+                        def tokenize(self, audio, sr=16000):
+                            # Simple tokenization method
+                            features = self.feature_extractor(audio, sampling_rate=sr, return_tensors="pt")
+                            with torch.no_grad():
+                                outputs = self.model(**features)
+                            return outputs.quantized_token_ids if hasattr(outputs, 'quantized_token_ids') else outputs
+                    
+                    return VoiceTokenizerWrapper(model, feature_extractor)
+            
+            print("Could not load GLM-4 voice tokenizer with custom approach")
+            return None
+            
+    except Exception as e:
+        print(f"Failed to load GLM-4 voice tokenizer: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 def get_model_info(model_path):
     """Get basic information about the model"""
@@ -209,90 +302,36 @@ def load_kimi_audio_model(model_path, device_map="auto"):
         print("Model loading failed. Please check the model files and configuration.")
         raise
 
-def load_tokenizer(tokenizer_path):
-    """Load GLM-4 tokenizer"""
-    print(f"\nLoading tokenizer from: {tokenizer_path}")
-    
-    # First check what files are in the tokenizer directory
-    if os.path.exists(tokenizer_path):
-        files = os.listdir(tokenizer_path)
-        print(f"Tokenizer files found: {files}")
-        
-        # Check for tokenizer config
-        tokenizer_config_file = os.path.join(tokenizer_path, "tokenizer_config.json")
-        if os.path.exists(tokenizer_config_file):
-            with open(tokenizer_config_file, 'r') as f:
-                tokenizer_config = json.load(f)
-            print(f"Tokenizer type: {tokenizer_config.get('tokenizer_class', 'Unknown')}")
+def load_text_tokenizer(model_path):
+    """Load text tokenizer from the Kimi-Audio model"""
+    print(f"\nLoading text tokenizer from Kimi-Audio model: {model_path}")
     
     try:
-        # Try loading with trust_remote_code first
+        # Try to load tokenizer from the main model directory
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path,
+            model_path,
             trust_remote_code=True,
-            use_fast=False  # Try slow tokenizer to avoid fast tokenizer issues
+            use_fast=False
         )
-    except Exception as e:
-        print(f"Failed to load tokenizer with AutoTokenizer: {e}")
         
-        # If it's a custom tokenizer, try loading directly
-        try:
-            # Check if there's a custom tokenizer file
-            tokenizer_files = [f for f in os.listdir(tokenizer_path) if f.startswith('tokenization_') and f.endswith('.py')]
-            
-            if tokenizer_files:
-                # Import custom tokenizer
-                tokenizer_file = os.path.join(tokenizer_path, tokenizer_files[0])
-                spec = importlib.util.spec_from_file_location("custom_tokenizer", tokenizer_file)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                
-                # Find tokenizer class
-                for name, obj in module.__dict__.items():
-                    if name.endswith('Tokenizer') and hasattr(obj, 'from_pretrained'):
-                        TokenizerClass = obj
-                        tokenizer = TokenizerClass.from_pretrained(tokenizer_path, trust_remote_code=True)
-                        break
+        # Set padding token if not set
+        if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is None:
+            if hasattr(tokenizer, 'eos_token') and tokenizer.eos_token:
+                tokenizer.pad_token = tokenizer.eos_token
             else:
-                raise ValueError("No custom tokenizer file found")
-                
-        except Exception as e2:
-            print(f"Failed to load custom tokenizer: {e2}")
-            raise
-    
-    # Set padding token if not set
-    if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is None:
-        if hasattr(tokenizer, 'eos_token') and tokenizer.eos_token:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            # Set a default pad token
-            try:
                 tokenizer.add_special_tokens({'pad_token': '<pad>'})
-            except:
-                print("Could not add pad token to tokenizer")
-    
-    print(f"Tokenizer loaded successfully!")
-    print(f"Tokenizer class: {type(tokenizer).__name__}")
-    
-    # Safely check for vocab_size
-    try:
+        
+        print(f"Text tokenizer loaded successfully!")
+        print(f"Tokenizer class: {type(tokenizer).__name__}")
+        
         if hasattr(tokenizer, 'vocab_size'):
             print(f"Vocab size: {tokenizer.vocab_size}")
-        elif hasattr(tokenizer, 'n_vocab'):
-            print(f"Vocab size: {tokenizer.n_vocab}")
-    except:
-        print("Could not determine vocab size")
-    
-    # Safely check for special tokens
-    try:
-        if hasattr(tokenizer, 'pad_token'):
-            print(f"Pad token: {tokenizer.pad_token}")
-        if hasattr(tokenizer, 'eos_token'):
-            print(f"EOS token: {tokenizer.eos_token}")
-    except:
-        print("Could not determine special tokens")
-    
-    return tokenizer
+        
+        return tokenizer
+        
+    except Exception as e:
+        print(f"Failed to load text tokenizer: {e}")
+        return None
 
 def configure_lora(model, target_modules=None):
     """Configure LoRA for the model"""
@@ -389,45 +428,47 @@ def test_model_setup():
         print("\n1. Loading Kimi-Audio Model:")
         model = load_kimi_audio_model(config['models']['kimi_audio'])
         
-        # 2. Load tokenizer
-        print("\n2. Loading Tokenizer:")
-        try:
-            tokenizer = load_tokenizer(config['models']['tokenizer'])
-        except Exception as e:
-            print(f"Failed to load tokenizer from {config['models']['tokenizer']}: {e}")
-            print("Trying to load tokenizer from Kimi-Audio model...")
-            try:
-                # Try loading tokenizer from the main model directory
-                tokenizer = load_tokenizer(config['models']['kimi_audio'])
-            except Exception as e2:
-                print(f"Failed to load tokenizer from Kimi-Audio model: {e2}")
-                print("Proceeding without tokenizer (ASR might not need text tokenizer)")
-                tokenizer = None
+        # 2. Load voice tokenizer (for audio tokenization)
+        print("\n2. Loading Voice Tokenizer:")
+        voice_tokenizer = load_glm4_voice_tokenizer(config['models']['tokenizer'])
+        if voice_tokenizer is None:
+            print("Voice tokenizer could not be loaded. This is used for audio tokenization.")
         
-        # 3. Configure LoRA
-        print("\n3. Configuring LoRA:")
+        # 3. Load text tokenizer (from Kimi-Audio model)
+        print("\n3. Loading Text Tokenizer:")
+        text_tokenizer = load_text_tokenizer(config['models']['kimi_audio'])
+        if text_tokenizer is None:
+            print("Text tokenizer could not be loaded from Kimi-Audio model.")
+            print("This is expected for some audio models.")
+        
+        # 4. Configure LoRA
+        print("\n4. Configuring LoRA:")
         model, lora_config = configure_lora(model)
         
-        # 4. Load Whisper processor
-        print("\n4. Loading Whisper Processor:")
+        # 5. Load Whisper processor
+        print("\n5. Loading Whisper Processor:")
         whisper_processor = WhisperProcessor.from_pretrained(config['models']['whisper'])
         print("Whisper processor loaded successfully!")
         
-        # 5. Test forward pass with dummy data
-        print("\n5. Testing Forward Pass:")
-        if tokenizer is not None:
+        # 6. Test forward pass with dummy data
+        print("\n6. Testing Forward Pass:")
+        if text_tokenizer is not None:
             try:
                 # Create dummy input
                 dummy_text = "This is a test transcription"
                 
-                # Handle different tokenizer types
+                # Safe tokenization
                 try:
-                    inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True)
-                except TypeError as e:
-                    # Some tokenizers might not support all parameters
+                    inputs = text_tokenizer(dummy_text, return_tensors="pt")
+                except Exception as e:
                     print(f"Standard tokenization failed: {e}")
-                    print("Trying simplified tokenization...")
-                    inputs = tokenizer(dummy_text, return_tensors="pt")
+                    print("Trying alternative tokenization...")
+                    # Try to encode directly
+                    if hasattr(text_tokenizer, 'encode'):
+                        input_ids = text_tokenizer.encode(dummy_text, return_tensors="pt")
+                        inputs = {'input_ids': input_ids}
+                    else:
+                        raise
                 
                 # Move to device
                 device = next(model.parameters()).device
@@ -447,13 +488,15 @@ def test_model_setup():
                 print(f"Forward pass test failed: {e}")
                 print("This might be expected for audio models that require special inputs")
         else:
-            print("Skipping forward pass test (no tokenizer available)")
+            print("Skipping text forward pass test (no text tokenizer available)")
             print("For ASR models, audio features are typically the main input")
         
         # Save model configuration
         model_setup = {
             "model_path": config['models']['kimi_audio'],
-            "tokenizer_path": config['models']['tokenizer'] if tokenizer is not None else None,
+            "voice_tokenizer_path": config['models']['tokenizer'],
+            "text_tokenizer_loaded": text_tokenizer is not None,
+            "voice_tokenizer_loaded": voice_tokenizer is not None,
             "whisper_path": config['models']['whisper'],
             "lora_config": {
                 "r": lora_config.r,
@@ -465,7 +508,6 @@ def test_model_setup():
             "model_dtype": "bfloat16",
             "total_params": sum(p.numel() for p in model.parameters()),
             "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
-            "tokenizer_loaded": tokenizer is not None
         }
         
         setup_path = os.path.join(CODE_DIR, "model_setup.json")
@@ -476,6 +518,10 @@ def test_model_setup():
         
         # Clean up
         del model
+        if voice_tokenizer is not None:
+            del voice_tokenizer
+        if text_tokenizer is not None:
+            del text_tokenizer
         torch.cuda.empty_cache()
         
         return True
@@ -501,6 +547,8 @@ def main():
             print("\n" + "=" * 50)
             print("Step 3 completed successfully!")
             print("Model and LoRA configuration ready.")
+            print("Voice tokenizer is for audio tokenization.")
+            print("Text tokenizer (if loaded) is for text processing.")
             print("Next step: Training script implementation")
         else:
             print("\nStep 3 encountered issues. Please check the errors above.")
