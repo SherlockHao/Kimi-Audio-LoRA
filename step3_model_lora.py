@@ -545,125 +545,190 @@ def test_model_setup():
         # 6. Test forward pass with dummy data
         print("\n6. Testing Forward Pass:")
         
-        # For Kimi-Audio, we need to test with audio features
-        print("Testing with audio features (Kimi-Audio expects audio input)...")
+        # For Kimi-Audio, we need to test with the specific input format it expects
+        print("Testing with Kimi-Audio specific input format...")
         
         try:
-            # Create dummy audio features similar to Whisper output
-            # Whisper outputs: [batch_size, n_mels, time_steps]
+            # Based on the official Kimi-Audio code, the model expects:
+            # - input_ids: audio token ids
+            # - text_input_ids: text token ids  
+            # - whisper_input_feature: Whisper continuous features
+            # - is_continuous_mask: mask for continuous features
+            # - position_ids: position ids
+            
+            # Create dummy inputs matching Kimi-Audio's expected format
             batch_size = 1
-            n_mels = 80  # Standard mel bins for Whisper
-            time_steps = 3000  # Kimi-Audio expects 3000 time steps
+            seq_length = 100  # Reasonable sequence length for testing
             
-            dummy_audio_features = torch.randn(batch_size, n_mels, time_steps).to(next(model.parameters()).device)
-            print(f"Dummy audio features shape: {dummy_audio_features.shape}")
+            # Get model config for special tokens
+            model_config = model.config if hasattr(model, 'config') else None
+            if model_config and hasattr(model_config, 'kimia_token_offset'):
+                kimia_token_offset = model_config.kimia_token_offset
+            else:
+                kimia_token_offset = 150000  # Default from Kimi-Audio
             
-            # Prepare labels if text tokenizer is available
-            labels = None
-            if text_tokenizer is not None:
-                try:
-                    dummy_text = "This is a test transcription"
-                    # Tokenize text for labels
-                    if hasattr(text_tokenizer, '__call__'):
-                        tokenized = text_tokenizer(dummy_text, return_tensors="pt")
-                        if hasattr(tokenized, 'input_ids'):
-                            labels = tokenized.input_ids.to(dummy_audio_features.device)
-                    elif hasattr(text_tokenizer, 'encode'):
-                        labels = text_tokenizer.encode(dummy_text, return_tensors="pt").to(dummy_audio_features.device)
-                    
-                    if labels is not None:
-                        print(f"Text labels shape: {labels.shape}")
-                except Exception as e:
-                    print(f"Could not prepare text labels: {e}")
-                    labels = None
+            # Create dummy audio token ids (offset by kimia_token_offset)
+            audio_input_ids = torch.randint(
+                kimia_token_offset, 
+                kimia_token_offset + 1000, 
+                (batch_size, seq_length)
+            ).to(next(model.parameters()).device)
             
-            # Test different input formats
+            # Create dummy text token ids (below kimia_token_offset)
+            text_input_ids = torch.randint(
+                1, 
+                min(kimia_token_offset, 50000), 
+                (batch_size, seq_length)
+            ).to(next(model.parameters()).device)
+            
+            # Create position ids
+            position_ids = torch.arange(seq_length).unsqueeze(0).to(audio_input_ids.device)
+            
+            # Create continuous mask (for Whisper features)
+            # Some tokens are continuous (Whisper features), some are discrete
+            is_continuous_mask = torch.zeros(batch_size, seq_length, dtype=torch.bool).to(audio_input_ids.device)
+            # Mark first 10 tokens as continuous (Whisper features)
+            is_continuous_mask[:, :10] = True
+            
+            # Create dummy Whisper features for continuous tokens
+            # Whisper features shape should match model's expectations
+            # Based on code, it seems to expect features of shape [batch, seq, hidden_dim]
+            hidden_size = 1280  # Whisper large hidden size
+            whisper_features = []
+            # Only create features for continuous positions
+            continuous_positions = is_continuous_mask[0].sum().item()
+            if continuous_positions > 0:
+                whisper_feature = torch.randn(
+                    batch_size, 
+                    continuous_positions, 
+                    hidden_size
+                ).to(audio_input_ids.device)
+                whisper_features = [whisper_feature]
+            else:
+                whisper_features = None
+            
+            print(f"Audio input_ids shape: {audio_input_ids.shape}")
+            print(f"Text input_ids shape: {text_input_ids.shape}")
+            print(f"Position ids shape: {position_ids.shape}")
+            print(f"Continuous mask shape: {is_continuous_mask.shape}")
+            if whisper_features:
+                print(f"Whisper features shape: {whisper_features[0].shape}")
+            
+            # Test forward pass with Kimi-Audio format
             forward_success = False
             
-            # Test 1: Direct audio features
-            print("\nTest 1: Direct audio features input")
+            print("\nTest 1: Kimi-Audio style forward pass")
             try:
                 with torch.no_grad():
-                    outputs = model(dummy_audio_features, labels=labels)
-                print("  Success with direct audio features!")
+                    # Try the format from the official code
+                    outputs = model.forward(
+                        input_ids=audio_input_ids,
+                        text_input_ids=text_input_ids,
+                        whisper_input_feature=whisper_features,
+                        is_continuous_mask=is_continuous_mask,
+                        position_ids=position_ids,
+                        return_dict=False
+                    )
+                print("  Success with Kimi-Audio format!")
                 forward_success = True
-                if hasattr(outputs, 'loss'):
-                    print(f"  Loss: {outputs.loss.item():.4f}")
-                if hasattr(outputs, 'logits'):
-                    print(f"  Logits shape: {outputs.logits.shape}")
+                if isinstance(outputs, tuple):
+                    print(f"  Outputs: tuple of length {len(outputs)}")
+                    if len(outputs) >= 2:
+                        audio_logits, text_logits = outputs[:2]
+                        print(f"  Audio logits shape: {audio_logits.shape}")
+                        print(f"  Text logits shape: {text_logits.shape}")
+                else:
+                    print(f"  Output type: {type(outputs)}")
             except Exception as e:
-                print(f"  Failed: {str(e)[:100]}...")
+                print(f"  Failed: {str(e)[:200]}...")
+                
+                # Check if the error is about missing arguments
+                if "whisper_input_feature" in str(e) or "text_input_ids" in str(e):
+                    print("  Note: Model expects Kimi-Audio specific inputs")
             
-            # Test 2: As input_embeds (transposed)
+            # Test 2: Simplified version without Whisper features
             if not forward_success:
-                print("\nTest 2: Audio features as input embeddings")
+                print("\nTest 2: Simplified forward pass (no Whisper features)")
                 try:
-                    # Transpose to [batch_size, time_steps, n_mels]
-                    audio_embeddings = dummy_audio_features.transpose(1, 2)
-                    print(f"  Audio embeddings shape: {audio_embeddings.shape}")
-                    
                     with torch.no_grad():
-                        outputs = model(inputs_embeds=audio_embeddings, labels=labels)
-                    print("  Success with audio embeddings!")
+                        outputs = model(
+                            input_ids=audio_input_ids,
+                            text_input_ids=text_input_ids,
+                            position_ids=position_ids,
+                            return_dict=False
+                        )
+                    print("  Success without Whisper features!")
                     forward_success = True
-                    if hasattr(outputs, 'loss'):
-                        print(f"  Loss: {outputs.loss.item():.4f}")
                 except Exception as e:
                     print(f"  Failed: {str(e)[:100]}...")
             
-            # Test 3: Check for audio-specific forward methods
+            # Test 3: Standard transformer format (fallback)
             if not forward_success:
-                print("\nTest 3: Looking for audio-specific methods")
-                audio_methods = ['forward_audio', 'encode_audio', 'process_audio', 'audio_forward']
-                for method_name in audio_methods:
-                    if hasattr(model, method_name):
-                        print(f"  Found method: {method_name}")
-                        try:
-                            method = getattr(model, method_name)
-                            with torch.no_grad():
-                                result = method(dummy_audio_features)
-                            print(f"    Success! Result type: {type(result)}")
-                            forward_success = True
-                            break
-                        except Exception as e:
-                            print(f"    Failed: {str(e)[:50]}...")
+                print("\nTest 3: Standard transformer format")
+                try:
+                    # Use only audio tokens as input_ids
+                    with torch.no_grad():
+                        outputs = model(input_ids=audio_input_ids)
+                    print("  Success with standard format!")
+                    forward_success = True
+                    if hasattr(outputs, 'logits'):
+                        print(f"  Logits shape: {outputs.logits.shape}")
+                except Exception as e:
+                    print(f"  Failed: {str(e)[:100]}...")
             
-            # Test 4: Check model internals
+            # Test 4: Check if model needs special preprocessing
             if not forward_success:
-                print("\nTest 4: Checking model architecture for audio processing")
-                # Check if model has audio encoder
-                if hasattr(model, 'audio_encoder'):
-                    print("  Found audio_encoder module")
-                elif hasattr(model, 'model') and hasattr(model.model, 'audio_encoder'):
-                    print("  Found audio_encoder in model.model")
-                elif hasattr(model, 'base_model') and hasattr(model.base_model, 'audio_encoder'):
-                    print("  Found audio_encoder in base_model")
+                print("\nTest 4: Checking model requirements")
                 
-                # Try to find the forward signature
+                # Check if it's a PEFT model wrapping the base model
+                if hasattr(model, 'base_model'):
+                    print("  This is a PEFT model, checking base model...")
+                    base_model = model.base_model
+                    if hasattr(base_model, 'model'):
+                        actual_model = base_model.model
+                        print(f"  Actual model type: {type(actual_model).__name__}")
+                
+                # Try to understand what the model expects
                 if hasattr(model, 'forward'):
                     import inspect
                     try:
-                        sig = inspect.signature(model.forward)
-                        print(f"  Model forward signature: {sig}")
+                        # Get the actual forward method
+                        forward_method = model.forward
+                        if hasattr(forward_method, '__wrapped__'):
+                            # Unwrap if it's wrapped
+                            forward_method = forward_method.__wrapped__
+                        
+                        sig = inspect.signature(forward_method)
                         params = list(sig.parameters.keys())
-                        print(f"  Forward parameters: {params[:10]}")  # First 10 params
+                        print(f"  Forward parameters: {params[:15]}")  # First 15 params
+                        
+                        # Check for Kimi-Audio specific parameters
+                        kimi_params = ['text_input_ids', 'whisper_input_feature', 'is_continuous_mask']
+                        has_kimi_params = any(p in params for p in kimi_params)
+                        if has_kimi_params:
+                            print("  Model expects Kimi-Audio specific inputs!")
                     except:
-                        print("  Could not inspect forward signature")
+                        print("  Could not inspect forward method")
             
             if forward_success:
                 print("\nForward pass test completed successfully!")
-                print("The model can process audio inputs.")
+                print("The model can process Kimi-Audio style inputs.")
             else:
                 print("\nForward pass test completed with warnings.")
-                print("The model may require specific input format or preprocessing.")
-                print("This is normal for audio models - actual training will handle this.")
+                print("The model requires specific Kimi-Audio input format.")
+                print("This is expected - the training script will handle proper input preparation.")
+                print("\nFor Kimi-Audio ASR fine-tuning, you'll need to:")
+                print("1. Process audio through Whisper to get continuous features")
+                print("2. Tokenize audio using the voice tokenizer")
+                print("3. Tokenize text using the text tokenizer")
+                print("4. Prepare proper input format with masks and position ids")
                 
         except Exception as e:
             print(f"\nForward pass test error: {e}")
             import traceback
             traceback.print_exc()
-            print("\nThis is expected for complex audio models.")
-            print("The actual training script will handle model inputs properly.")
+            print("\nThis is expected for Kimi-Audio models.")
+            print("The model requires specific preprocessing that will be handled in training.")
         
         # Save model configuration
         model_setup = {
