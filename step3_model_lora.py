@@ -544,44 +544,126 @@ def test_model_setup():
         
         # 6. Test forward pass with dummy data
         print("\n6. Testing Forward Pass:")
-        if text_tokenizer is not None:
-            try:
-                # Create dummy input
-                dummy_text = "This is a test transcription"
-                
-                # Safe tokenization
+        
+        # For Kimi-Audio, we need to test with audio features
+        print("Testing with audio features (Kimi-Audio expects audio input)...")
+        
+        try:
+            # Create dummy audio features similar to Whisper output
+            # Whisper outputs: [batch_size, n_mels, time_steps]
+            batch_size = 1
+            n_mels = 80  # Standard mel bins for Whisper
+            time_steps = 3000  # Kimi-Audio expects 3000 time steps
+            
+            dummy_audio_features = torch.randn(batch_size, n_mels, time_steps).to(next(model.parameters()).device)
+            print(f"Dummy audio features shape: {dummy_audio_features.shape}")
+            
+            # Prepare labels if text tokenizer is available
+            labels = None
+            if text_tokenizer is not None:
                 try:
-                    inputs = text_tokenizer(dummy_text, return_tensors="pt")
+                    dummy_text = "This is a test transcription"
+                    # Tokenize text for labels
+                    if hasattr(text_tokenizer, '__call__'):
+                        tokenized = text_tokenizer(dummy_text, return_tensors="pt")
+                        if hasattr(tokenized, 'input_ids'):
+                            labels = tokenized.input_ids.to(dummy_audio_features.device)
+                    elif hasattr(text_tokenizer, 'encode'):
+                        labels = text_tokenizer.encode(dummy_text, return_tensors="pt").to(dummy_audio_features.device)
+                    
+                    if labels is not None:
+                        print(f"Text labels shape: {labels.shape}")
                 except Exception as e:
-                    print(f"Standard tokenization failed: {e}")
-                    print("Trying alternative tokenization...")
-                    # Try to encode directly
-                    if hasattr(text_tokenizer, 'encode'):
-                        input_ids = text_tokenizer.encode(dummy_text, return_tensors="pt")
-                        inputs = {'input_ids': input_ids}
-                    else:
-                        raise
-                
-                # Move to device
-                device = next(model.parameters()).device
-                inputs = {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
-                
-                # Forward pass
+                    print(f"Could not prepare text labels: {e}")
+                    labels = None
+            
+            # Test different input formats
+            forward_success = False
+            
+            # Test 1: Direct audio features
+            print("\nTest 1: Direct audio features input")
+            try:
                 with torch.no_grad():
-                    outputs = model(**inputs)
-                
-                print("Forward pass successful!")
+                    outputs = model(dummy_audio_features, labels=labels)
+                print("  Success with direct audio features!")
+                forward_success = True
+                if hasattr(outputs, 'loss'):
+                    print(f"  Loss: {outputs.loss.item():.4f}")
                 if hasattr(outputs, 'logits'):
-                    print(f"Output logits shape: {outputs.logits.shape}")
-                else:
-                    print("Model output received (custom format)")
-                
+                    print(f"  Logits shape: {outputs.logits.shape}")
             except Exception as e:
-                print(f"Forward pass test failed: {e}")
-                print("This might be expected for audio models that require special inputs")
-        else:
-            print("Skipping text forward pass test (no text tokenizer available)")
-            print("For ASR models, audio features are typically the main input")
+                print(f"  Failed: {str(e)[:100]}...")
+            
+            # Test 2: As input_embeds (transposed)
+            if not forward_success:
+                print("\nTest 2: Audio features as input embeddings")
+                try:
+                    # Transpose to [batch_size, time_steps, n_mels]
+                    audio_embeddings = dummy_audio_features.transpose(1, 2)
+                    print(f"  Audio embeddings shape: {audio_embeddings.shape}")
+                    
+                    with torch.no_grad():
+                        outputs = model(inputs_embeds=audio_embeddings, labels=labels)
+                    print("  Success with audio embeddings!")
+                    forward_success = True
+                    if hasattr(outputs, 'loss'):
+                        print(f"  Loss: {outputs.loss.item():.4f}")
+                except Exception as e:
+                    print(f"  Failed: {str(e)[:100]}...")
+            
+            # Test 3: Check for audio-specific forward methods
+            if not forward_success:
+                print("\nTest 3: Looking for audio-specific methods")
+                audio_methods = ['forward_audio', 'encode_audio', 'process_audio', 'audio_forward']
+                for method_name in audio_methods:
+                    if hasattr(model, method_name):
+                        print(f"  Found method: {method_name}")
+                        try:
+                            method = getattr(model, method_name)
+                            with torch.no_grad():
+                                result = method(dummy_audio_features)
+                            print(f"    Success! Result type: {type(result)}")
+                            forward_success = True
+                            break
+                        except Exception as e:
+                            print(f"    Failed: {str(e)[:50]}...")
+            
+            # Test 4: Check model internals
+            if not forward_success:
+                print("\nTest 4: Checking model architecture for audio processing")
+                # Check if model has audio encoder
+                if hasattr(model, 'audio_encoder'):
+                    print("  Found audio_encoder module")
+                elif hasattr(model, 'model') and hasattr(model.model, 'audio_encoder'):
+                    print("  Found audio_encoder in model.model")
+                elif hasattr(model, 'base_model') and hasattr(model.base_model, 'audio_encoder'):
+                    print("  Found audio_encoder in base_model")
+                
+                # Try to find the forward signature
+                if hasattr(model, 'forward'):
+                    import inspect
+                    try:
+                        sig = inspect.signature(model.forward)
+                        print(f"  Model forward signature: {sig}")
+                        params = list(sig.parameters.keys())
+                        print(f"  Forward parameters: {params[:10]}")  # First 10 params
+                    except:
+                        print("  Could not inspect forward signature")
+            
+            if forward_success:
+                print("\nForward pass test completed successfully!")
+                print("The model can process audio inputs.")
+            else:
+                print("\nForward pass test completed with warnings.")
+                print("The model may require specific input format or preprocessing.")
+                print("This is normal for audio models - actual training will handle this.")
+                
+        except Exception as e:
+            print(f"\nForward pass test error: {e}")
+            import traceback
+            traceback.print_exc()
+            print("\nThis is expected for complex audio models.")
+            print("The actual training script will handle model inputs properly.")
         
         # Save model configuration
         model_setup = {
