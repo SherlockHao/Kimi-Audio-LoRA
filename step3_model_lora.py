@@ -34,86 +34,178 @@ def load_glm4_voice_tokenizer(tokenizer_path):
     print(f"\nLoading GLM-4 voice tokenizer from: {tokenizer_path}")
     
     try:
-        # Add tokenizer path to sys.path
-        if tokenizer_path not in sys.path:
-            sys.path.insert(0, tokenizer_path)
+        # First, let's check what files are in the tokenizer directory
+        print("Files in tokenizer directory:")
+        for item in os.listdir(tokenizer_path)[:20]:  # List first 20 items
+            print(f"  - {item}")
         
-        # Check if the custom tokenizer files exist
-        glm4_tokenizer_file = os.path.join(tokenizer_path, "glm4_tokenizer.py")
-        glm4_utils_file = os.path.join(tokenizer_path, "glm4_utils.py")
+        # Check for subdirectories that might contain the tokenizer
+        subdirs = [d for d in os.listdir(tokenizer_path) if os.path.isdir(os.path.join(tokenizer_path, d))]
+        if subdirs:
+            print(f"Subdirectories found: {subdirs}")
         
-        if not os.path.exists(glm4_tokenizer_file):
-            # Try to find it in subdirectories
+        # Method 1: Try to load WhisperVQEncoder directly (based on the glm4_tokenizer.py source)
+        try:
+            # Look for configuration files
+            config_file = os.path.join(tokenizer_path, "config.json")
+            if os.path.exists(config_file):
+                with open(config_file, 'r') as f:
+                    tokenizer_config = json.load(f)
+                print(f"Found config.json with model_type: {tokenizer_config.get('model_type', 'unknown')}")
+            
+            # Import the necessary modules for WhisperVQEncoder
+            # First check if there's a modeling_whisper.py file
+            modeling_files = []
             for root, dirs, files in os.walk(tokenizer_path):
-                if "glm4_tokenizer.py" in files:
-                    glm4_tokenizer_file = os.path.join(root, "glm4_tokenizer.py")
-                    glm4_utils_file = os.path.join(root, "glm4_utils.py")
-                    break
-        
-        if os.path.exists(glm4_tokenizer_file):
-            # Import the custom tokenizer
-            spec = importlib.util.spec_from_file_location("glm4_tokenizer", glm4_tokenizer_file)
-            tokenizer_module = importlib.util.module_from_spec(spec)
-            sys.modules["glm4_tokenizer"] = tokenizer_module
-            spec.loader.exec_module(tokenizer_module)
-            
-            # Import utils if exists
-            if os.path.exists(glm4_utils_file):
-                spec_utils = importlib.util.spec_from_file_location("glm4_utils", glm4_utils_file)
-                utils_module = importlib.util.module_from_spec(spec_utils)
-                sys.modules["glm4_utils"] = utils_module
-                spec_utils.loader.exec_module(utils_module)
-            
-            # Get the tokenizer class
-            Glm4Tokenizer = getattr(tokenizer_module, "Glm4Tokenizer")
-            
-            # Initialize the voice tokenizer
-            voice_tokenizer = Glm4Tokenizer(tokenizer_path)
-            
-            print("GLM-4 voice tokenizer loaded successfully!")
-            print("This is an audio tokenizer, not a text tokenizer")
-            
-            return voice_tokenizer
-        else:
-            # Fallback: try to load as WhisperVQEncoder
-            print("Custom tokenizer files not found, trying WhisperVQEncoder approach...")
-            
-            from transformers import WhisperFeatureExtractor
-            
-            # Check for WhisperVQEncoder in the directory
-            modeling_files = [f for f in os.listdir(tokenizer_path) if "modeling" in f and f.endswith(".py")]
+                for f in files:
+                    if 'modeling' in f and f.endswith('.py'):
+                        modeling_files.append(os.path.join(root, f))
             
             if modeling_files:
-                # Import the modeling file
-                modeling_file = os.path.join(tokenizer_path, modeling_files[0])
-                spec = importlib.util.spec_from_file_location("whisper_vq", modeling_file)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+                print(f"Found modeling files: {[os.path.basename(f) for f in modeling_files]}")
                 
-                # Try to find WhisperVQEncoder class
-                WhisperVQEncoder = getattr(module, "WhisperVQEncoder", None)
-                
-                if WhisperVQEncoder:
-                    model = WhisperVQEncoder.from_pretrained(tokenizer_path)
-                    feature_extractor = WhisperFeatureExtractor.from_pretrained(tokenizer_path)
-                    
-                    # Create a simple wrapper
-                    class VoiceTokenizerWrapper:
-                        def __init__(self, model, feature_extractor):
-                            self.model = model.eval()
-                            self.feature_extractor = feature_extractor
+                # Try to import the modeling file
+                for modeling_file in modeling_files:
+                    try:
+                        # Add parent directory to path
+                        parent_dir = os.path.dirname(modeling_file)
+                        if parent_dir not in sys.path:
+                            sys.path.insert(0, parent_dir)
                         
-                        def tokenize(self, audio, sr=16000):
-                            # Simple tokenization method
-                            features = self.feature_extractor(audio, sampling_rate=sr, return_tensors="pt")
-                            with torch.no_grad():
-                                outputs = self.model(**features)
-                            return outputs.quantized_token_ids if hasattr(outputs, 'quantized_token_ids') else outputs
-                    
-                    return VoiceTokenizerWrapper(model, feature_extractor)
+                        # Import the module
+                        module_name = os.path.splitext(os.path.basename(modeling_file))[0]
+                        spec = importlib.util.spec_from_file_location(module_name, modeling_file)
+                        module = importlib.util.module_from_spec(spec)
+                        sys.modules[module_name] = module
+                        spec.loader.exec_module(module)
+                        
+                        # Look for WhisperVQEncoder
+                        if hasattr(module, 'WhisperVQEncoder'):
+                            WhisperVQEncoder = module.WhisperVQEncoder
+                            print("Found WhisperVQEncoder class!")
+                            
+                            # Load the model
+                            model = WhisperVQEncoder.from_pretrained(tokenizer_path)
+                            feature_extractor = WhisperFeatureExtractor.from_pretrained(tokenizer_path)
+                            
+                            # Create a wrapper class similar to Glm4Tokenizer
+                            class Glm4TokenizerWrapper(torch.nn.Module):
+                                def __init__(self, model, feature_extractor):
+                                    super().__init__()
+                                    self.whisper_model = model.eval()
+                                    self.feature_extractor = feature_extractor
+                                
+                                def tokenize(self, speech=None, audio_path=None, sr=16000):
+                                    import librosa
+                                    
+                                    if audio_path:
+                                        audio, sr = librosa.load(audio_path, sr=16000)
+                                        audio = torch.tensor(audio).unsqueeze(0)
+                                        audio_info = (audio, sr)
+                                    else:
+                                        assert speech is not None
+                                        assert sr
+                                        if isinstance(speech, list):
+                                            speech = torch.tensor(speech).unsqueeze(0)
+                                        if len(speech.shape) == 1:
+                                            speech = speech.unsqueeze(0)
+                                        audio_info = (speech, sr)
+                                    
+                                    # Process audio to get tokens
+                                    features = self.feature_extractor(
+                                        audio_info[0].squeeze().numpy(),
+                                        sampling_rate=sr,
+                                        return_tensors="pt"
+                                    )
+                                    
+                                    with torch.no_grad():
+                                        if torch.cuda.is_available():
+                                            features = {k: v.cuda() for k, v in features.items()}
+                                            self.whisper_model = self.whisper_model.cuda()
+                                        outputs = self.whisper_model(**features)
+                                    
+                                    # Return quantized tokens
+                                    if hasattr(outputs, 'quantized_token_ids'):
+                                        return outputs.quantized_token_ids
+                                    else:
+                                        # Fallback to any token-like output
+                                        return outputs[0] if isinstance(outputs, tuple) else outputs
+                                
+                                def to(self, device):
+                                    self.whisper_model = self.whisper_model.to(device)
+                                    return self
+                            
+                            voice_tokenizer = Glm4TokenizerWrapper(model, feature_extractor)
+                            print("GLM-4 voice tokenizer loaded successfully using WhisperVQEncoder!")
+                            return voice_tokenizer
+                            
+                    except Exception as e:
+                        print(f"Failed to load from {os.path.basename(modeling_file)}: {e}")
+                        continue
             
-            print("Could not load GLM-4 voice tokenizer with custom approach")
-            return None
+            # Method 2: Try AutoModel approach
+            print("\nTrying AutoModel approach for WhisperVQEncoder...")
+            from transformers import AutoModel
+            
+            try:
+                model = AutoModel.from_pretrained(tokenizer_path, trust_remote_code=True)
+                feature_extractor = WhisperFeatureExtractor.from_pretrained(tokenizer_path)
+                
+                # Create wrapper
+                class Glm4TokenizerWrapper(torch.nn.Module):
+                    def __init__(self, model, feature_extractor):
+                        super().__init__()
+                        self.whisper_model = model.eval()
+                        self.feature_extractor = feature_extractor
+                    
+                    def tokenize(self, speech=None, audio_path=None, sr=16000):
+                        import librosa
+                        
+                        if audio_path:
+                            audio, sr = librosa.load(audio_path, sr=16000)
+                            audio = torch.tensor(audio).unsqueeze(0)
+                        else:
+                            assert speech is not None
+                            if isinstance(speech, list):
+                                speech = torch.tensor(speech).unsqueeze(0)
+                            if len(speech.shape) == 1:
+                                speech = speech.unsqueeze(0)
+                            audio = speech
+                        
+                        # Process audio
+                        features = self.feature_extractor(
+                            audio.squeeze().numpy(),
+                            sampling_rate=sr,
+                            return_tensors="pt"
+                        )
+                        
+                        with torch.no_grad():
+                            outputs = self.whisper_model(**features)
+                        
+                        # Return tokens
+                        if hasattr(outputs, 'quantized_token_ids'):
+                            return outputs.quantized_token_ids
+                        else:
+                            return outputs[0] if isinstance(outputs, tuple) else outputs
+                    
+                    def to(self, device):
+                        self.whisper_model = self.whisper_model.to(device)
+                        return self
+                
+                voice_tokenizer = Glm4TokenizerWrapper(model, feature_extractor)
+                print("GLM-4 voice tokenizer loaded successfully using AutoModel!")
+                return voice_tokenizer
+                
+            except Exception as e:
+                print(f"AutoModel approach failed: {e}")
+            
+        except Exception as e:
+            print(f"WhisperVQEncoder loading failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("Could not load GLM-4 voice tokenizer")
+        return None
             
     except Exception as e:
         print(f"Failed to load GLM-4 voice tokenizer: {e}")
